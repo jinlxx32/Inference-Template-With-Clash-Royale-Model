@@ -11,6 +11,12 @@ venv/
 env/
 ENV/
 
+# Tools & Binaries
+tools/
+
+
+
+
 # Output Results (Keep folder structure via .gitkeep, ignore generated annotated outputs)
 result/*
 !result/.gitkeep

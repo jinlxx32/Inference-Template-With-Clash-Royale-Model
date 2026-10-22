@@ -9,3 +9,10 @@ Pillow>=9.0.0
 
 # Desktop GUI Framework
 customtkinter>=5.2.0
+
+# Live Screen & Stream Decoding
+mss>=10.0.0
+pywin32>=306
+av>=19.0.0
+
+
