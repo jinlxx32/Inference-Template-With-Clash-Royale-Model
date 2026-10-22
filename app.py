@@ -13,6 +13,7 @@ Features:
 import os
 import sys
 import time
+import queue
 import subprocess
 import threading
 from pathlib import Path
@@ -146,6 +147,7 @@ class App(ctk.CTk):
         self.selected_root_folder: Optional[Path] = None
         self.confidence_var = ctk.DoubleVar(value=0.25)
         self.stride_var = ctk.IntVar(value=1)
+        self.batch_size_var = ctk.IntVar(value=4)
         self.ai_engine_ready = False
 
         # Model Memory Cache (Eliminates repeated cold-start delays)
@@ -355,11 +357,32 @@ class App(ctk.CTk):
         )
         self.btn_preload_model.grid(row=1, column=4, padx=(5, 15), pady=8)
 
+        row2_frame = ctk.CTkFrame(model_card, fg_color="transparent")
+        row2_frame.grid(row=2, column=0, columnspan=5, sticky="ew", padx=15, pady=(0, 12))
+        row2_frame.grid_columnconfigure(0, weight=1)
+
         self.lbl_model_info = ctk.CTkLabel(
-            model_card, text="Select a model. Tip: Click '⚡ Preload to VRAM' to eliminate the initial 15s delay!",
+            row2_frame, text="Select a model. Tip: Click '⚡ Preload to VRAM' to eliminate the initial 15s delay!",
             font=ctk.CTkFont(size=12), text_color="gray60"
         )
-        self.lbl_model_info.grid(row=2, column=0, columnspan=5, sticky="w", padx=15, pady=(0, 12))
+        self.lbl_model_info.grid(row=0, column=0, sticky="w")
+
+        batch_box = ctk.CTkFrame(row2_frame, fg_color="transparent")
+        batch_box.grid(row=0, column=1, sticky="e")
+
+        ctk.CTkLabel(batch_box, text="📦 Batch Size:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(0, 6))
+
+        self.slider_batch_size = ctk.CTkSlider(
+            batch_box, from_=1, to=16, number_of_steps=15, width=120,
+            variable=self.batch_size_var, command=self._on_batch_size_change
+        )
+        self.slider_batch_size.pack(side="left", padx=(0, 8))
+
+        self.lbl_batch_size = ctk.CTkLabel(
+            batch_box, text=f"Batch: {self.batch_size_var.get()} (MX150 Safe)",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color="#81C784", width=145
+        )
+        self.lbl_batch_size.pack(side="left")
 
         # ========================================================
         # 2. Input Media Queue Card
@@ -627,6 +650,13 @@ class App(ctk.CTk):
                 self.model_dropdown.configure(values=["(No models in models/)"])
                 self.selected_model_name.set("")
                 self.lbl_model_info.configure(text="⚠️ Please put your YOLO .pt model inside 'models/' folder.")
+
+    def _on_batch_size_change(self, val):
+        b = int(round(val))
+        self.batch_size_var.set(b)
+        if hasattr(self, "lbl_batch_size"):
+            hint = "(MX150 Safe)" if b <= 4 else ("(Fast)" if b <= 8 else "(High VRAM)")
+            self.lbl_batch_size.configure(text=f"Batch: {b} {hint}")
 
     def _on_model_selected(self, choice: str):
         # Reset cache if a different model is picked
@@ -1267,7 +1297,9 @@ class App(ctk.CTk):
             self.after(0, lambda: self._log(f"Error processing image {source_path.name}: {e}"))
 
     def _process_single_video(self, model, source_path: Path, out_file: Path, conf: float, stride: int, device: str, batch_info=None):
-        global cv2
+        global cv2, torch
+        import queue
+
         cap = cv2.VideoCapture(str(source_path.resolve()))
         if not cap.isOpened():
             self.after(0, lambda: self._log(f"Cannot open video source: {source_path.name}"))
@@ -1283,6 +1315,26 @@ class App(ctk.CTk):
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(out_file.resolve()), fourcc, out_fps, (width, height))
 
+        # --- Decoupled Background Video Writer Thread ---
+        write_queue = queue.Queue(maxsize=64)
+        write_error = [None]
+
+        def background_writer():
+            while True:
+                item = write_queue.get()
+                if item is None:
+                    write_queue.task_done()
+                    break
+                try:
+                    writer.write(item)
+                except Exception as err:
+                    write_error[0] = err
+                finally:
+                    write_queue.task_done()
+
+        writer_thread = threading.Thread(target=background_writer, daemon=True)
+        writer_thread.start()
+
         frame_idx = 0
         processed_count = 0
         total_detections_count = 0
@@ -1290,6 +1342,77 @@ class App(ctk.CTk):
         fps_tracker_time = time.time()
         fps_tracker_count = 0
         current_fps = 0.0
+
+        current_batch_size = max(1, self.batch_size_var.get())
+        batch_frames = []
+
+        def execute_batch(frames: list) -> int:
+            """Run YOLO on a batch of frames in FP32 with automatic OOM recovery."""
+            nonlocal current_batch_size, device
+            if not frames:
+                return 0
+
+            det_count = 0
+            try:
+                # Run FP32 inference on batch (MX150 safe)
+                results = model.predict(source=frames, conf=conf, device=device, half=False, verbose=False)
+                for r in results:
+                    if r and len(r) > 0:
+                        annotated = r.plot()
+                        write_queue.put(annotated)
+                        if r.boxes is not None:
+                            det_count += len(r.boxes)
+                    else:
+                        write_queue.put(frames[0])
+                return det_count
+
+            except Exception as oom_e:
+                err_str = str(oom_e).lower()
+                is_oom = "out of memory" in err_str or ("cuda" in err_str and "memory" in err_str)
+                if is_oom:
+                    if torch is not None and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    if current_batch_size > 1:
+                        new_batch = max(1, current_batch_size // 2)
+                        current_batch_size = new_batch
+                        self.after(0, lambda nb=new_batch: self._log(
+                            f"⚠️ VRAM Out of Memory! Auto-reducing batch size to {nb} and retrying..."
+                        ))
+                        self.after(0, lambda nb=new_batch: self.batch_size_var.set(nb))
+                        self.after(0, lambda nb=new_batch: self._on_batch_size_change(nb))
+
+                        # Recursively process smaller chunks
+                        sub_count = 0
+                        for i in range(0, len(frames), new_batch):
+                            sub_count += execute_batch(frames[i:i + new_batch])
+                        return sub_count
+                    else:
+                        # Even batch 1 failed on GPU: fall back gracefully to CPU
+                        self.after(0, lambda: self._log(
+                            "⚠️ GPU VRAM exceeded at batch 1. Falling back to CPU mode..."
+                        ))
+                        device = "cpu"
+                        try:
+                            results = model.predict(source=frames, conf=conf, device="cpu", half=False, verbose=False)
+                            for r in results:
+                                if r and len(r) > 0:
+                                    write_queue.put(r.plot())
+                                    if r.boxes is not None:
+                                        det_count += len(r.boxes)
+                                else:
+                                    write_queue.put(frames[0])
+                            return det_count
+                        except Exception as cpu_e:
+                            self.after(0, lambda ce=cpu_e: self._log(f"CPU fallback error: {ce}"))
+                            for f in frames:
+                                write_queue.put(f)
+                            return 0
+                else:
+                    self.after(0, lambda e=oom_e: self._log(f"Inference error: {e}"))
+                    for f in frames:
+                        write_queue.put(f)
+                    return 0
 
         try:
             while cap.isOpened():
@@ -1302,58 +1425,64 @@ class App(ctk.CTk):
                     break
 
                 if frame_idx % stride == 0:
-                    res = model.predict(source=frame, conf=conf, device=device, verbose=False)
-                    if res and len(res) > 0:
-                        annotated = res[0].plot()
-                        writer.write(annotated)
-                        boxes = res[0].boxes
-                        if boxes is not None:
-                            total_detections_count += len(boxes)
-                    else:
-                        writer.write(frame)
+                    batch_frames.append(frame)
 
-                    processed_count += 1
-                    fps_tracker_count += 1
+                    if len(batch_frames) >= current_batch_size:
+                        dets = execute_batch(batch_frames)
+                        total_detections_count += dets
+                        processed_count += len(batch_frames)
+                        fps_tracker_count += len(batch_frames)
+                        batch_frames.clear()
 
-                    now = time.time()
-                    time_diff = now - fps_tracker_time
-                    if time_diff >= 0.5:
-                        current_fps = fps_tracker_count / time_diff
-                        fps_tracker_time = now
-                        fps_tracker_count = 0
+                        now = time.time()
+                        time_diff = now - fps_tracker_time
+                        if time_diff >= 0.5:
+                            current_fps = fps_tracker_count / time_diff
+                            fps_tracker_time = now
+                            fps_tracker_count = 0
 
-                        file_progress = processed_count / max(effective_total, 1)
-                        if batch_info:
-                            b_idx, b_total = batch_info
-                            overall_progress = ((b_idx - 1) + file_progress) / b_total
-                        else:
-                            overall_progress = file_progress
+                            file_progress = processed_count / max(effective_total, 1)
+                            if batch_info:
+                                b_idx, b_total = batch_info
+                                overall_progress = ((b_idx - 1) + file_progress) / b_total
+                            else:
+                                overall_progress = file_progress
 
-                        elapsed = now - start_time
-                        eta_seconds = (elapsed / max(file_progress, 0.001)) - elapsed if file_progress < 1.0 else 0
+                            elapsed = now - start_time
+                            eta_seconds = (elapsed / max(file_progress, 0.001)) - elapsed if file_progress < 1.0 else 0
 
-                        elapsed_str = time.strftime("%M:%S", time.gmtime(elapsed))
-                        eta_str = time.strftime("%M:%S", time.gmtime(max(eta_seconds, 0)))
+                            elapsed_str = time.strftime("%M:%S", time.gmtime(elapsed))
+                            eta_str = time.strftime("%M:%S", time.gmtime(max(eta_seconds, 0)))
 
-                        progress_text = (
-                            f"📊 File {batch_info[0]}/{batch_info[1]}:\n{processed_count}/{effective_total} frames"
-                            if batch_info else
-                            f"📊 Progress:\n{processed_count} / {effective_total} frames ({int(file_progress * 100)}%)"
-                        )
+                            progress_text = (
+                                f"📊 File {batch_info[0]}/{batch_info[1]}:\n{processed_count}/{effective_total} frames"
+                                if batch_info else
+                                f"📊 Progress:\n{processed_count} / {effective_total} frames ({int(file_progress * 100)}%)"
+                            )
 
-                        self._dispatch_metrics_update(
-                            progress_ratio=overall_progress,
-                            current_fps=current_fps,
-                            progress_text=progress_text,
-                            elapsed_str=elapsed_str,
-                            eta_str=eta_str,
-                            detections=total_detections_count
-                        )
+                            self._dispatch_metrics_update(
+                                progress_ratio=overall_progress,
+                                current_fps=current_fps,
+                                progress_text=progress_text,
+                                elapsed_str=elapsed_str,
+                                eta_str=eta_str,
+                                detections=total_detections_count
+                            )
 
                 frame_idx += 1
 
+            # Flush any remaining frames in the last partial batch
+            if batch_frames and not self.stop_requested.is_set():
+                dets = execute_batch(batch_frames)
+                total_detections_count += dets
+                processed_count += len(batch_frames)
+                batch_frames.clear()
+
         finally:
             cap.release()
+            # Finish writer thread and release file
+            write_queue.put(None)
+            writer_thread.join(timeout=15.0)
             writer.release()
 
         elapsed_total = time.time() - start_time
