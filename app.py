@@ -39,6 +39,7 @@ RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+BATCH_PRESETS = [1, 2, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128]
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -370,19 +371,29 @@ class App(ctk.CTk):
         batch_box = ctk.CTkFrame(row2_frame, fg_color="transparent")
         batch_box.grid(row=0, column=1, sticky="e")
 
-        ctk.CTkLabel(batch_box, text="📦 Batch Size:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(0, 6))
+        ctk.CTkLabel(batch_box, text="📦 Batch:", font=ctk.CTkFont(size=12, weight="bold")).pack(side="left", padx=(0, 4))
 
+        default_idx = BATCH_PRESETS.index(4) if 4 in BATCH_PRESETS else 2
         self.slider_batch_size = ctk.CTkSlider(
-            batch_box, from_=1, to=16, number_of_steps=15, width=120,
-            variable=self.batch_size_var, command=self._on_batch_size_change
+            batch_box, from_=0, to=len(BATCH_PRESETS) - 1, number_of_steps=len(BATCH_PRESETS) - 1,
+            width=120, command=self._on_batch_slider_moved
         )
-        self.slider_batch_size.pack(side="left", padx=(0, 8))
+        self.slider_batch_size.set(default_idx)
+        self.slider_batch_size.pack(side="left", padx=(0, 6))
 
         self.lbl_batch_size = ctk.CTkLabel(
-            batch_box, text=f"Batch: {self.batch_size_var.get()} (MX150 Safe)",
-            font=ctk.CTkFont(size=12, weight="bold"), text_color="#81C784", width=145
+            batch_box, text="Batch: 4 (Safe/MX150)",
+            font=ctk.CTkFont(size=12, weight="bold"), text_color="#81C784", width=150
         )
-        self.lbl_batch_size.pack(side="left")
+        self.lbl_batch_size.pack(side="left", padx=(0, 8))
+
+        self.btn_benchmark_batch = ctk.CTkButton(
+            batch_box, text="⚡ Benchmark Sweet Spot", width=160, height=26,
+            fg_color="#E65100", hover_color="#BF360C",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            command=self.benchmark_sweet_spot
+        )
+        self.btn_benchmark_batch.pack(side="left")
 
         # ========================================================
         # 2. Input Media Queue Card
@@ -651,12 +662,34 @@ class App(ctk.CTk):
                 self.selected_model_name.set("")
                 self.lbl_model_info.configure(text="⚠️ Please put your YOLO .pt model inside 'models/' folder.")
 
-    def _on_batch_size_change(self, val):
-        b = int(round(val))
+    def _on_batch_slider_moved(self, val):
+        idx = int(round(val))
+        b = BATCH_PRESETS[max(0, min(idx, len(BATCH_PRESETS) - 1))]
         self.batch_size_var.set(b)
+        self._update_batch_label(b)
+
+    def _update_batch_label(self, b: int):
         if hasattr(self, "lbl_batch_size"):
-            hint = "(MX150 Safe)" if b <= 4 else ("(Fast)" if b <= 8 else "(High VRAM)")
-            self.lbl_batch_size.configure(text=f"Batch: {b} {hint}")
+            if b <= 4:
+                hint = "(Safe/MX150)"
+                color = "#81C784"
+            elif b <= 16:
+                hint = "(Fast/Mid GPU)"
+                color = "#90CAF9"
+            elif b <= 64:
+                hint = "(High VRAM)"
+                color = "#FFB74D"
+            else:
+                hint = "(Extreme/16GB+)"
+                color = "#BA68C8"
+            self.lbl_batch_size.configure(text=f"Batch: {b} {hint}", text_color=color)
+
+    def set_batch_size(self, b: int):
+        self.batch_size_var.set(b)
+        idx = min(range(len(BATCH_PRESETS)), key=lambda i: abs(BATCH_PRESETS[i] - b))
+        if hasattr(self, "slider_batch_size"):
+            self.slider_batch_size.set(idx)
+        self._update_batch_label(b)
 
     def _on_model_selected(self, choice: str):
         # Reset cache if a different model is picked
@@ -841,6 +874,143 @@ class App(ctk.CTk):
                 self.after(0, on_error)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # ----------------- Feature 3: Automated Batch Sweet Spot Benchmark -----------------
+    def benchmark_sweet_spot(self):
+        """Run an automated speed benchmark across batch sizes to discover the hardware sweet spot."""
+        global YOLO, torch
+        model_path = self._locate_model_file()
+        if not model_path:
+            messagebox.showwarning("Select Model", "Please select a valid model from the dropdown first.")
+            return
+
+        if not self.ai_engine_ready or YOLO is None:
+            messagebox.showinfo("Please Wait", "AI Engine is warming up in background. Please wait 1-2 seconds.")
+            return
+
+        if self.is_inferencing or self.is_preloading:
+            messagebox.showinfo("Busy", "Inference or model operation currently in progress.")
+            return
+
+        self._log("\n" + "=" * 54)
+        self._log(f"⚡ Starting Hardware Batch Benchmark for '{model_path.name}'...")
+        self.lbl_model_info.configure(text="⚡ Benchmarking hardware batch sweet spot in progress...", text_color="#FFB74D")
+        if hasattr(self, "btn_benchmark_batch"):
+            self.btn_benchmark_batch.configure(state="disabled", text="⏳ Testing...")
+
+        def worker():
+            import numpy as np
+            device = self._get_device_identifier()
+            try:
+                # Use cached model if available or load
+                if self.cached_model is not None and self.cached_model_path == model_path:
+                    model = self.cached_model
+                else:
+                    model = YOLO(str(model_path.resolve()))
+                    self.cached_model = model
+                    self.cached_model_path = model_path
+
+                # Candidate batches to test based on available VRAM
+                test_batches = [1, 2, 4, 6, 8, 16]
+                if torch is not None and torch.cuda.is_available() and device != "cpu":
+                    try:
+                        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                        if vram_gb >= 6.0:
+                            test_batches.extend([24, 32, 64])
+                        if vram_gb >= 15.0:
+                            test_batches.extend([96, 128])
+                    except Exception:
+                        pass
+
+                results = {}
+                base_fps = 0.0
+
+                # Warmup pass
+                dummy_warmup = np.zeros((640, 640, 3), dtype=np.uint8)
+                model.predict(source=dummy_warmup, device=device, half=False, verbose=False)
+                if torch is not None and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+                for b in test_batches:
+                    try:
+                        if torch is not None and torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                        dummy_batch = [np.zeros((640, 640, 3), dtype=np.uint8) for _ in range(b)]
+                        # Warmup this batch size
+                        model.predict(source=dummy_batch, device=device, half=False, verbose=False)
+                        if torch is not None and torch.cuda.is_available():
+                            torch.cuda.synchronize()
+
+                        iterations = 2 if b >= 16 else 3
+                        t0 = time.time()
+                        for _ in range(iterations):
+                            model.predict(source=dummy_batch, device=device, half=False, verbose=False)
+                            if torch is not None and torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                        t_total = time.time() - t0
+
+                        fps = (b * iterations) / max(t_total, 0.0001)
+                        results[b] = fps
+
+                        if b == 1:
+                            base_fps = fps
+                            self.after(0, lambda f=fps: self._log(f"  • Batch 1:   {f:.1f} FPS (Baseline)"))
+                        else:
+                            gain = ((fps - base_fps) / max(base_fps, 0.001)) * 100
+                            self.after(0, lambda b_=b, f=fps, g=gain: self._log(
+                                f"  • Batch {b_:<3}: {f:.1f} FPS ({'+' if g >= 0 else ''}{g:.1f}% vs Batch 1)"
+                            ))
+
+                    except Exception as b_err:
+                        err_str = str(b_err).lower()
+                        if "out of memory" in err_str or ("cuda" in err_str and "memory" in err_str):
+                            self.after(0, lambda b_=b: self._log(f"  • Batch {b_:<3}: ⚠️ Out of VRAM (Hardware saturation limit)"))
+                            if torch is not None and torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                            break
+                        else:
+                            self.after(0, lambda b_=b, e=b_err: self._log(f"  • Batch {b_}: Skipped ({e})"))
+                            break
+
+                if not results:
+                    self.after(0, lambda: self._log("Benchmark encountered an issue or model was not ready."))
+                    self.after(0, self._restore_benchmark_ui)
+                    return
+
+                # Calculate optimal sweet spot (batch achieving >= 95% of peak throughput with lowest VRAM)
+                max_fps = max(results.values())
+                candidates = [b for b, f in results.items() if f >= max_fps * 0.95]
+                sweet_spot = candidates[0] if candidates else max(results, key=results.get)
+                sweet_fps = results[sweet_spot]
+
+                def on_complete():
+                    self._restore_benchmark_ui()
+                    self.set_batch_size(sweet_spot)
+                    self._update_model_info_text()
+                    self._log("=" * 54)
+                    self._log(f"🏆 Sweet Spot Found: Batch {sweet_spot} ({sweet_fps:.1f} FPS)")
+                    self._log(f"   Batch Size slider automatically configured to {sweet_spot}.\n")
+                    messagebox.showinfo(
+                        "Benchmark Results",
+                        f"Hardware Benchmark Complete for {model_path.name} on {device}!\n\n"
+                        f"• Peak Speed Measured: {max_fps:.1f} FPS\n"
+                        f"• Optimal Sweet Spot:   Batch {sweet_spot} ({sweet_fps:.1f} FPS)\n\n"
+                        f"The Batch Size slider has been automatically set to {sweet_spot} for maximum throughput without wasting VRAM."
+                    )
+
+                self.after(0, on_complete)
+
+            except Exception as e:
+                self.after(0, lambda err=e: self._log(f"Benchmark error: {err}"))
+                self.after(0, self._restore_benchmark_ui)
+                self.after(0, self._update_model_info_text)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _restore_benchmark_ui(self):
+        if hasattr(self, "btn_benchmark_batch"):
+            self.btn_benchmark_batch.configure(state="normal", text="⚡ Benchmark Sweet Spot")
 
     def refresh_samples(self):
         sample_files = []
@@ -1379,8 +1549,7 @@ class App(ctk.CTk):
                         self.after(0, lambda nb=new_batch: self._log(
                             f"⚠️ VRAM Out of Memory! Auto-reducing batch size to {nb} and retrying..."
                         ))
-                        self.after(0, lambda nb=new_batch: self.batch_size_var.set(nb))
-                        self.after(0, lambda nb=new_batch: self._on_batch_size_change(nb))
+                        self.after(0, lambda nb=new_batch: self.set_batch_size(nb))
 
                         # Recursively process smaller chunks
                         sub_count = 0
