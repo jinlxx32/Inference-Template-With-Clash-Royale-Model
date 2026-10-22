@@ -108,8 +108,41 @@ class NamedPipeStream:
         return 0
 
 
+_CUSTOM_CARD_MAP: Optional[Dict[str, str]] = None
+_CUSTOM_CARD_MAP_MTIME: float = 0.0
+
+def load_custom_card_map() -> Dict[str, str]:
+    """Load or reload assets/card_map.json if file was modified."""
+    global _CUSTOM_CARD_MAP, _CUSTOM_CARD_MAP_MTIME
+    map_file = BASE_DIR / "assets" / "card_map.json"
+    if not map_file.exists():
+        return {}
+    try:
+        mtime = map_file.stat().st_mtime
+        if _CUSTOM_CARD_MAP is not None and mtime == _CUSTOM_CARD_MAP_MTIME:
+            return _CUSTOM_CARD_MAP
+        with open(map_file, "r", encoding="utf-8") as f:
+            _CUSTOM_CARD_MAP = json.load(f)
+        _CUSTOM_CARD_MAP_MTIME = mtime
+        return _CUSTOM_CARD_MAP
+    except Exception:
+        return _CUSTOM_CARD_MAP or {}
+
+
 def resolve_card_info(raw_name: str) -> Tuple[str, Optional[Path]]:
     """Convert raw model label (e.g. Knight_D, Pekka_D) to clean display name and image path."""
+    # 1. Check custom JSON mapping first if specified
+    custom_map = load_custom_card_map()
+    if raw_name in custom_map:
+        target_file = custom_map[raw_name]
+        p = CARDS_DIR / target_file
+        if p.exists():
+            clean_display = raw_name.replace("_D", "").replace("_", " ")
+            clean_display = re.sub(r'([a-z0-9])([A-Z])', r'\1 \2', clean_display)
+            if "evo" in raw_name.lower() and "(Evo)" not in clean_display:
+                clean_display += " (Evo)"
+            return clean_display, p
+
     clean = re.sub(r'_D$', '', raw_name)
     is_evo = bool(re.search(r'Evo(_D)?$', raw_name, re.IGNORECASE))
 

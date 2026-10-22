@@ -11,16 +11,24 @@ This repository contains **two complete, independent desktop applications**:
 ## ⚠️ Important Note Regarding the Included Model (`best_cr.pt`)
 
 > [!WARNING]
-> **Sample Model Accuracy & Known Errors:**
-> The included weights (`models/best_cr.pt`) are provided as a demonstration model trained specifically on unit **deployment** animations (`_D` labels and spell casts).
+> **Sample Model Miscalculations & Custom Models:**
+> The included weights (`models/best_cr.pt`) are provided strictly as a demonstration / proof-of-concept checkpoint.
 >
-> **Known Classification Quirks:**
-> * **Accurate Classes:** Units like **Knight**, **Furnace**, **Goblin Barrel**, and **Fireball** generally detect with high accuracy.
-> * **Known Misclassifications:** Due to training dataset class imbalance and visual overlap, certain units exhibit known labeling errors (e.g. heavy ground tanks such as **P.E.K.K.A**, **Mega Knight**, or **Royal Giant** may misclassify as **Royal Ghost**, and **Dart Goblin** may register as **Bandit**).
-> * **Tuning Confidence:** You can raise the **Confidence slider** (e.g. to `40% - 50%`) to filter out weak false positives.
+> * **Model Miscalculations:** You should expect misclassifications and detection errors across various units during inference. You can adjust the **Confidence slider** (e.g. to `40% - 50%`) to help filter out weak false detections.
+> * **100% Modular — Drop In Your Own Model:** Both applications are completely decoupled from this sample file. You can drop any custom-trained YOLO `.pt` model into the `models/` directory and it will appear immediately in the model dropdown.
 >
-> **100% Modular — Drop In Your Own Model:**
-> Both applications are completely decoupled from this specific model file. If you train a new or improved YOLO model, simply drop your `.pt` file into the `models/` directory. It will appear immediately in the **Model dropdown** in both apps with zero code changes needed.
+> **⚠️ Required: Resyncing Your Model Labels with Card Assets**
+> When using your own trained model, **you are required to resync your model's class label names with the card portrait asset names** in `assets/cards/` so the Live Card Tracker displays the correct images:
+> * **Option 1 (Using `assets/card_map.json` — Recommended):**
+>   Map your custom class labels directly to image filenames in [`assets/card_map.json`](file:///c:/Users/tanre/Downloads/CR_Model/assets/card_map.json) (you can edit this manually or prompt an AI to generate the mapping):
+>   ```json
+>   {
+>     "your_custom_model_label": "knight.png",
+>     "another_label_name": "mega-knight.png"
+>   }
+>   ```
+> * **Option 2 (Label Naming):**
+>   Name your dataset classes to match the image names in `assets/cards/` (e.g., `knight`, `fireball`, `mega-knight`, `hog-rider`).
 
 ---
 
@@ -58,6 +66,7 @@ CR_Model/
 ├── models/                     # Place your trained YOLO models (.pt) here
 │   └── best_cr.pt              # Included sample deployment model
 ├── assets/
+│   ├── card_map.json           # Model label -> card portrait image mapping dictionary
 │   └── cards/                  # 204 official Clash Royale card portrait PNGs
 ├── samples/                    # Sample gameplay videos for testing
 │   ├── sample1.mp4
@@ -107,12 +116,12 @@ Double-click **`run_app.bat`** (or run `python app.py`).
 3. Click **`▶ Start Inference`** and view results in `result/`.
 
 ### To use App 2 (Live Phone Screen & Deck Tracker):
-1. **Connect your Android phone** to your PC with a USB cable (or start an emulator like LDPlayer/BlueStacks).
-2. **Enable USB Debugging** on your phone (*Settings -> Developer Options -> Turn on USB Debugging*). Tap **Allow** when prompted on your phone.
-3. Double-click **`run_live_app.bat`** (or run `python live_app.py`).
+1. Double-click **`run_live_app.bat`** (or run `python live_app.py`) first and let the app window open and finish loading the AI engine.
+2. **Connect your Android phone** to your PC with a USB cable (or start an emulator like LDPlayer/BlueStacks) and make sure **USB Debugging** is enabled (*Settings -> Developer Options -> Turn on USB Debugging*, tapping **Allow** on your phone if prompted).
+3. Click the **`🔄 Scan`** button next to the Phone dropdown to detect your connected device.
 4. **Choose your hardware & device:**
    * Select your preferred **⚡ Compute** device (e.g. `GPU: NVIDIA GeForce RTX...` or `CPU`).
-   * If multiple phones/emulators are connected, pick your target phone from the **`📱 Phone`** dropdown (click **`🔄 Scan`** if newly plugged in).
+   * Select your phone from the **`📱 Phone`** dropdown.
 5. Click **`▶ Connect & Stream Phone`**.
 6. Your screen will stream live in the center monitor, and cards will automatically cycle between Red (in cycle) and Green (in hand) on the right panel as you play!
 7. Click **`🔄 Clear / Reset`** between games to reset the tracker.
