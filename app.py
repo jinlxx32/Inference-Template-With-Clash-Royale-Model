@@ -48,10 +48,16 @@ def open_in_explorer(target_path: Path):
     if not os.path.exists(path_str):
         path_str = str(RESULT_DIR.resolve())
     try:
-        if os.path.isfile(path_str):
-            subprocess.run(["explorer.exe", f"/select,{path_str}"], check=False)
+        if sys.platform == "win32":
+            if os.path.isfile(path_str):
+                subprocess.run(["explorer.exe", f"/select,{path_str}"], check=False)
+            else:
+                os.startfile(path_str)
+        elif sys.platform == "darwin":
+            subprocess.run(["open", path_str], check=False)
         else:
-            os.startfile(path_str)
+            # Linux / Ubuntu
+            subprocess.run(["xdg-open", path_str], check=False)
     except Exception as e:
         messagebox.showerror("Error Opening Explorer", f"Could not open explorer:\n{e}")
 
